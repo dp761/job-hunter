@@ -1,0 +1,35 @@
+# Environment & secrets
+.env
+*.env
+
+# Personal data
+connections.csv
+master_resume.pdf
+resume_prompt.txt
+scored_urls.txt
+linkedin_session.json
+
+# Generated files
+generated_resumes/
+job_hunter.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,457 @@
+"""
+Secondary Scraper
+==================
+Scrapes job boards that JobSpy doesn't support:
+  - Built In (builtin.com)
+  - Y Combinator Work at a Startup (workatastartup.com)
+  - Jobright (jobright.ai)
+
+Uses requests + BeautifulSoup. No Playwright needed.
+Returns jobs in the same dict format as scraper.py for seamless integration.
+"""
+
+import logging
+import re
+import time
+from datetime import datetime, timedelta
+from urllib.parse import quote_plus
+
+import requests
+from bs4 import BeautifulSoup
+
+import config
+
+logger = logging.getLogger(__name__)
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# -------------------------------------------------------------------
+# BUILT IN (builtin.com)
+# -------------------------------------------------------------------
+
+BUILTIN_ROLE_SLUGS = {
+    "Product Manager": "product-management",
+    "Associate Product Manager": "product-management",
+    "Product Analyst": "product-management",
+    "Business Analyst": "business-analyst",
+    "Solution Architect": "solutions-architect",
+}
+
+BUILTIN_LOCATION_MAP = {
+    # Maps your SEARCH_LOCATIONS to Built In URL slugs
+    # Add your city here, e.g. "New York": "new-york", "San Francisco": "san-francisco"
+    # Full list at: https://builtin.com/jobs
+    "Remote": "remote",
+}
+
+
+def _scrape_builtin() -> list[dict]:
+    """Scrape jobs from Built In."""
+    jobs = []
+    seen_urls = set()
+
+    for title, slug in BUILTIN_ROLE_SLUGS.items():
+        for location, loc_slug in BUILTIN_LOCATION_MAP.items():
+            url = f"https://builtin.com/jobs/{loc_slug}/{slug}"
+            logger.info(f"  Built In: {url}")
+
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=15)
+                if resp.status_code != 200:
+                    logger.warning(f"  -> Built In returned {resp.status_code}")
+                    continue
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+
+                # Built In uses data-id job cards
+                cards = soup.select('[data-id="job-card"], .job-card, article.job-bounded-card')
+                if not cards:
+                    # Try alternative selectors
+                    cards = soup.select("div[class*='job-card'], div[class*='JobCard']")
+
+                for card in cards:
+                    try:
+                        # Title
+                        title_el = card.select_one("h2 a, h3 a, a[class*='job-title'], a[data-id='job-card-alias']")
+                        if not title_el:
+                            continue
+                        job_title = title_el.get_text(strip=True)
+                        job_url = title_el.get("href", "")
+                        if job_url and not job_url.startswith("http"):
+                            job_url = "https://builtin.com" + job_url
+
+                        if job_url in seen_urls:
+                            continue
+                        seen_urls.add(job_url)
+
+                        # Company
+                        company_el = card.select_one("div[class*='company-name'], span[class*='company'], a[class*='company']")
+                        company = company_el.get_text(strip=True) if company_el else ""
+
+                        # Location
+                        loc_el = card.select_one("div[class*='location'], span[class*='location']")
+                        job_location = loc_el.get_text(strip=True) if loc_el else location
+
+                        jobs.append({
+                            "title": job_title,
+                            "company": company,
+                            "location": job_location,
+                            "url": job_url,
+                            "description": "",  # Would need a second fetch per job
+                            "site": "builtin",
+                            "date_posted": None,
+                            "salary": "",
+                        })
+                    except Exception:
+                        continue
+
+                logger.info(f"  -> Found {len(cards)} cards, {len(jobs)} total")
+                time.sleep(2)
+
+            except Exception as e:
+                logger.warning(f"  -> Built In error: {e}")
+
+    return jobs
+
+
+# -------------------------------------------------------------------
+# Y COMBINATOR - WORK AT A STARTUP (workatastartup.com)
+# -------------------------------------------------------------------
+
+# YC uses Algolia search under the hood. We can query their public API.
+YC_ALGOLIA_URL = "https://45bwzj1sgc-dsn.algolia.net/1/indexes/*/queries"
+YC_ALGOLIA_PARAMS = {
+    "x-algolia-agent": "Algolia for JavaScript (4.14.2)",
+    "x-algolia-application-id": "45BWZJ1SGC",
+    "x-algolia-api-key": "MjBjYjRiMzY0NzdhZWY0NjExY2NhZjYxMGIxYjc2MTAwNWFkNTkwNTc4NjgxYjU0YzFhYTY2ZGQ5OGY5NDMzZnJlc3RyaWN0SW5kaWNlcz0lNUIlMjJZQ0NvbXBhbnlfcHJvZHVjdGlvbiUyMiUyQyUyMllDQ29tcGFueV9CeV9MYXVuY2hfRGF0ZV9wcm9kdWN0aW9uJTIyJTJDJTIyWUNDb21wYW55X0J5X0xhc3RfQWN0aXZpdHlfcHJvZHVjdGlvbiUyMiUyQyUyMllDSm9iX3Byb2R1Y3Rpb24lMjIlNUQmdGFnRmlsdGVycz0lNUIlMjJ5Y19iYXRjaF9hbGwlMjIlNUQmYW5hbHl0aWNzVGFncz0lNUIlMjJ5Y2RjJTIyJTVE",
+}
+
+YC_ROLE_QUERIES = [
+    "Product Manager",
+    "Business Analyst",
+    "Product Analyst",
+    "Solution Architect",
+]
+
+
+def _scrape_yc() -> list[dict]:
+    """Scrape jobs from Y Combinator's Work at a Startup via Algolia API."""
+    jobs = []
+    seen_urls = set()
+
+    for query in YC_ROLE_QUERIES:
+        logger.info(f"  YC Work at a Startup: searching '{query}'")
+
+        payload = {
+            "requests": [
+                {
+                    "indexName": "YCJob_production",
+                    "params": f"query={quote_plus(query)}&hitsPerPage=30&page=0",
+                }
+            ]
+        }
+
+        try:
+            resp = requests.post(
+                YC_ALGOLIA_URL,
+                headers={**HEADERS, "Content-Type": "application/json"},
+                params=YC_ALGOLIA_PARAMS,
+                json=payload,
+                timeout=15,
+            )
+
+            if resp.status_code != 200:
+                logger.warning(f"  -> YC Algolia returned {resp.status_code}")
+                # Fallback to HTML scraping
+                _scrape_yc_html(jobs, seen_urls, query)
+                continue
+
+            data = resp.json()
+            results = data.get("results", [])
+            if not results:
+                continue
+
+            hits = results[0].get("hits", [])
+            for hit in hits:
+                try:
+                    job_id = hit.get("objectID", "")
+                    job_url = f"https://www.workatastartup.com/jobs/{job_id}"
+
+                    if job_url in seen_urls:
+                        continue
+                    seen_urls.add(job_url)
+
+                    job_title = hit.get("title", "")
+                    company = hit.get("company_name", "")
+                    job_location = hit.get("pretty_location", hit.get("location", ""))
+                    description = hit.get("description", "")
+                    salary_min = hit.get("salary_min", "")
+                    salary_max = hit.get("salary_max", "")
+                    salary = f"{salary_min} - {salary_max}" if salary_min else ""
+
+                    created = hit.get("created_at", "")
+                    date_posted = None
+                    if created:
+                        try:
+                            date_posted = datetime.fromtimestamp(created)
+                        except Exception:
+                            pass
+
+                    jobs.append({
+                        "title": job_title,
+                        "company": company,
+                        "location": job_location,
+                        "url": job_url,
+                        "description": description[:3000],
+                        "site": "y-combinator",
+                        "date_posted": date_posted,
+                        "salary": salary,
+                    })
+                except Exception:
+                    continue
+
+            logger.info(f"  -> Found {len(hits)} hits, {len(jobs)} total")
+            time.sleep(1)
+
+        except Exception as e:
+            logger.warning(f"  -> YC Algolia error: {e}")
+            _scrape_yc_html(jobs, seen_urls, query)
+
+    return jobs
+
+
+def _scrape_yc_html(jobs: list, seen_urls: set, query: str):
+    """Fallback: scrape YC jobs via HTML if Algolia API fails."""
+    url = f"https://www.workatastartup.com/jobs?query={quote_plus(query)}"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        links = soup.select("a[href*='/jobs/']")
+
+        for link in links:
+            href = link.get("href", "")
+            if not href or href in seen_urls:
+                continue
+            if not re.match(r"/jobs/\d+", href):
+                continue
+
+            full_url = "https://www.workatastartup.com" + href
+            seen_urls.add(full_url)
+
+            title = link.get_text(strip=True)
+            if title:
+                jobs.append({
+                    "title": title,
+                    "company": "",
+                    "location": "",
+                    "url": full_url,
+                    "description": "",
+                    "site": "y-combinator",
+                    "date_posted": None,
+                    "salary": "",
+                })
+    except Exception as e:
+        logger.warning(f"  -> YC HTML fallback error: {e}")
+
+
+# -------------------------------------------------------------------
+# JOBRIGHT (jobright.ai)
+# -------------------------------------------------------------------
+
+JOBRIGHT_SEARCH_URL = "https://jobright.ai/jobs"
+
+
+def _scrape_jobright() -> list[dict]:
+    """Scrape jobs from Jobright.ai."""
+    jobs = []
+    seen_urls = set()
+
+    for title in config.JOB_TITLES:
+        for location in config.SEARCH_LOCATIONS:
+            query = quote_plus(title)
+            loc = quote_plus(location)
+            url = f"{JOBRIGHT_SEARCH_URL}?query={query}&location={loc}"
+            logger.info(f"  Jobright: '{title}' in '{location}'")
+
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=15)
+                if resp.status_code != 200:
+                    logger.warning(f"  -> Jobright returned {resp.status_code}")
+                    continue
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+
+                # Try to find job cards - Jobright uses React so HTML might be minimal
+                # Look for JSON data in script tags (common pattern for React SSR)
+                scripts = soup.select("script[type='application/json'], script#__NEXT_DATA__")
+                for script in scripts:
+                    try:
+                        import json
+                        data = json.loads(script.string or "{}")
+
+                        # Navigate Next.js data structure
+                        props = data.get("props", {}).get("pageProps", {})
+                        job_list = props.get("jobs", props.get("initialJobs", []))
+
+                        if not isinstance(job_list, list):
+                            continue
+
+                        for item in job_list:
+                            job_title = item.get("title", "")
+                            company = item.get("company", item.get("companyName", ""))
+                            job_location = item.get("location", "")
+                            job_url = item.get("url", item.get("link", ""))
+                            description = item.get("description", "")
+
+                            if not job_url:
+                                job_id = item.get("id", item.get("_id", ""))
+                                if job_id:
+                                    job_url = f"https://jobright.ai/jobs/{job_id}"
+
+                            if not job_url or job_url in seen_urls:
+                                continue
+                            seen_urls.add(job_url)
+
+                            jobs.append({
+                                "title": job_title,
+                                "company": company if isinstance(company, str) else company.get("name", ""),
+                                "location": job_location,
+                                "url": job_url,
+                                "description": description[:3000],
+                                "site": "jobright",
+                                "date_posted": None,
+                                "salary": "",
+                            })
+                    except (json.JSONDecodeError, AttributeError):
+                        continue
+
+                # Fallback: try parsing visible HTML job cards
+                if not jobs:
+                    cards = soup.select("div[class*='job'], a[class*='job'], div[class*='Job']")
+                    for card in cards:
+                        try:
+                            link = card if card.name == "a" else card.select_one("a")
+                            if not link:
+                                continue
+                            href = link.get("href", "")
+                            if not href or href in seen_urls:
+                                continue
+                            if not href.startswith("http"):
+                                href = "https://jobright.ai" + href
+                            seen_urls.add(href)
+
+                            job_title = link.get_text(strip=True)[:200]
+                            jobs.append({
+                                "title": job_title,
+                                "company": "",
+                                "location": location,
+                                "url": href,
+                                "description": "",
+                                "site": "jobright",
+                                "date_posted": None,
+                                "salary": "",
+                            })
+                        except Exception:
+                            continue
+
+                logger.info(f"  -> {len(jobs)} jobs so far from Jobright")
+                time.sleep(2)
+
+            except Exception as e:
+                logger.warning(f"  -> Jobright error: {e}")
+
+    return jobs
+
+
+# -------------------------------------------------------------------
+# FETCH JOB DESCRIPTIONS (for jobs missing descriptions)
+# -------------------------------------------------------------------
+
+def _fetch_description(job: dict) -> str:
+    """Fetch the full job description from the job URL."""
+    if job.get("description"):
+        return job["description"]
+
+    try:
+        resp = requests.get(job["url"], headers=HEADERS, timeout=10)
+        if resp.status_code != 200:
+            return ""
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Try common description containers
+        for selector in [
+            "div[class*='description']",
+            "div[class*='job-description']",
+            "div[class*='jobDescription']",
+            "section[class*='description']",
+            "article",
+            "main",
+        ]:
+            el = soup.select_one(selector)
+            if el and len(el.get_text(strip=True)) > 100:
+                return el.get_text(separator="\n", strip=True)[:3000]
+
+        return ""
+    except Exception:
+        return ""
+
+
+# -------------------------------------------------------------------
+# PUBLIC API: Called by main.py
+# -------------------------------------------------------------------
+
+def scrape_secondary_sites() -> list[dict]:
+    """
+    Scrape all secondary job sites.
+    Returns deduplicated list in the same format as scraper.py.
+    """
+    all_jobs = []
+
+    # Built In
+    logger.info("Scraping Built In...")
+    try:
+        builtin_jobs = _scrape_builtin()
+        all_jobs.extend(builtin_jobs)
+        logger.info(f"  -> Built In: {len(builtin_jobs)} jobs")
+    except Exception as e:
+        logger.warning(f"  -> Built In failed: {e}")
+
+    # Y Combinator
+    logger.info("Scraping Y Combinator Work at a Startup...")
+    try:
+        yc_jobs = _scrape_yc()
+        all_jobs.extend(yc_jobs)
+        logger.info(f"  -> YC: {len(yc_jobs)} jobs")
+    except Exception as e:
+        logger.warning(f"  -> YC failed: {e}")
+
+    # Jobright
+    logger.info("Scraping Jobright...")
+    try:
+        jobright_jobs = _scrape_jobright()
+        all_jobs.extend(jobright_jobs)
+        logger.info(f"  -> Jobright: {len(jobright_jobs)} jobs")
+    except Exception as e:
+        logger.warning(f"  -> Jobright failed: {e}")
+
+    # Fetch descriptions for jobs that are missing them
+    missing_desc = [j for j in all_jobs if not j.get("description")]
+    if missing_desc:
+        logger.info(f"Fetching descriptions for {len(missing_desc)} jobs (max 20)...")
+        for job in missing_desc[:20]:  # Cap at 20 to avoid being too aggressive
+            desc = _fetch_description(job)
+            if desc:
+                job["description"] = desc
+            time.sleep(1.5)
+
+    logger.info(f"Secondary scraper total: {len(all_jobs)} jobs")
+    return all_jobs
