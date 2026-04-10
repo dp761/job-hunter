@@ -43,9 +43,7 @@ BUILTIN_ROLE_SLUGS = {
 }
 
 BUILTIN_LOCATION_MAP = {
-    # Maps your SEARCH_LOCATIONS to Built In URL slugs
-    # Add your city here, e.g. "New York": "new-york", "San Francisco": "san-francisco"
-    # Full list at: https://builtin.com/jobs
+    "Georgia": "atlanta",
     "Remote": "remote",
 }
 
@@ -123,14 +121,6 @@ def _scrape_builtin() -> list[dict]:
 # Y COMBINATOR - WORK AT A STARTUP (workatastartup.com)
 # -------------------------------------------------------------------
 
-# YC uses Algolia search under the hood. We can query their public API.
-YC_ALGOLIA_URL = "https://45bwzj1sgc-dsn.algolia.net/1/indexes/*/queries"
-YC_ALGOLIA_PARAMS = {
-    "x-algolia-agent": "Algolia for JavaScript (4.14.2)",
-    "x-algolia-application-id": "45BWZJ1SGC",
-    "x-algolia-api-key": "MjBjYjRiMzY0NzdhZWY0NjExY2NhZjYxMGIxYjc2MTAwNWFkNTkwNTc4NjgxYjU0YzFhYTY2ZGQ5OGY5NDMzZnJlc3RyaWN0SW5kaWNlcz0lNUIlMjJZQ0NvbXBhbnlfcHJvZHVjdGlvbiUyMiUyQyUyMllDQ29tcGFueV9CeV9MYXVuY2hfRGF0ZV9wcm9kdWN0aW9uJTIyJTJDJTIyWUNDb21wYW55X0J5X0xhc3RfQWN0aXZpdHlfcHJvZHVjdGlvbiUyMiUyQyUyMllDSm9iX3Byb2R1Y3Rpb24lMjIlNUQmdGFnRmlsdGVycz0lNUIlMjJ5Y19iYXRjaF9hbGwlMjIlNUQmYW5hbHl0aWNzVGFncz0lNUIlMjJ5Y2RjJTIyJTVE",
-}
-
 YC_ROLE_QUERIES = [
     "Product Manager",
     "Business Analyst",
@@ -140,126 +130,107 @@ YC_ROLE_QUERIES = [
 
 
 def _scrape_yc() -> list[dict]:
-    """Scrape jobs from Y Combinator's Work at a Startup via Algolia API."""
+    """Scrape jobs from Y Combinator's Work at a Startup via HTML."""
     jobs = []
     seen_urls = set()
 
     for query in YC_ROLE_QUERIES:
         logger.info(f"  YC Work at a Startup: searching '{query}'")
 
-        payload = {
-            "requests": [
-                {
-                    "indexName": "YCJob_production",
-                    "params": f"query={quote_plus(query)}&hitsPerPage=30&page=0",
-                }
-            ]
-        }
-
+        url = f"https://www.workatastartup.com/jobs?query={quote_plus(query)}"
         try:
-            resp = requests.post(
-                YC_ALGOLIA_URL,
-                headers={**HEADERS, "Content-Type": "application/json"},
-                params=YC_ALGOLIA_PARAMS,
-                json=payload,
-                timeout=15,
-            )
-
+            resp = requests.get(url, headers=HEADERS, timeout=15)
             if resp.status_code != 200:
-                logger.warning(f"  -> YC Algolia returned {resp.status_code}")
-                # Fallback to HTML scraping
-                _scrape_yc_html(jobs, seen_urls, query)
+                logger.warning(f"  -> YC returned {resp.status_code}")
                 continue
 
-            data = resp.json()
-            results = data.get("results", [])
-            if not results:
-                continue
+            soup = BeautifulSoup(resp.text, "html.parser")
 
-            hits = results[0].get("hits", [])
-            for hit in hits:
+            # Try to extract job data from Next.js JSON payload
+            script = soup.select_one("script#__NEXT_DATA__")
+            if script and script.string:
                 try:
-                    job_id = hit.get("objectID", "")
-                    job_url = f"https://www.workatastartup.com/jobs/{job_id}"
+                    import json
+                    data = json.loads(script.string)
+                    props = data.get("props", {}).get("pageProps", {})
 
-                    if job_url in seen_urls:
-                        continue
-                    seen_urls.add(job_url)
+                    # Navigate various possible structures
+                    job_list = (
+                        props.get("jobs", []) or
+                        props.get("jobListings", []) or
+                        props.get("results", []) or
+                        []
+                    )
 
-                    job_title = hit.get("title", "")
-                    company = hit.get("company_name", "")
-                    job_location = hit.get("pretty_location", hit.get("location", ""))
-                    description = hit.get("description", "")
-                    salary_min = hit.get("salary_min", "")
-                    salary_max = hit.get("salary_max", "")
-                    salary = f"{salary_min} - {salary_max}" if salary_min else ""
-
-                    created = hit.get("created_at", "")
-                    date_posted = None
-                    if created:
+                    for item in job_list:
                         try:
-                            date_posted = datetime.fromtimestamp(created)
-                        except Exception:
-                            pass
+                            job_id = item.get("id", item.get("_id", ""))
+                            job_url = f"https://www.workatastartup.com/jobs/{job_id}" if job_id else ""
 
-                    jobs.append({
-                        "title": job_title,
-                        "company": company,
-                        "location": job_location,
-                        "url": job_url,
-                        "description": description[:3000],
-                        "site": "y-combinator",
-                        "date_posted": date_posted,
-                        "salary": salary,
-                    })
-                except Exception:
+                            if not job_url or job_url in seen_urls:
+                                continue
+                            seen_urls.add(job_url)
+
+                            job_title = item.get("title", "")
+                            company_data = item.get("company", {})
+                            company = company_data.get("name", "") if isinstance(company_data, dict) else str(company_data)
+                            job_location = item.get("pretty_location", item.get("location", ""))
+                            description = item.get("description", "")
+
+                            jobs.append({
+                                "title": job_title,
+                                "company": company,
+                                "location": job_location,
+                                "url": job_url,
+                                "description": description[:3000],
+                                "site": "y-combinator",
+                                "date_posted": None,
+                                "salary": "",
+                            })
+                        except Exception:
+                            continue
+
+                    if job_list:
+                        logger.info(f"  -> Found {len(job_list)} jobs from JSON, {len(jobs)} total")
+                        time.sleep(1)
+                        continue
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            # Fallback: parse visible HTML links
+            links = soup.select("a[href*='/jobs/']")
+            found = 0
+            for link in links:
+                href = link.get("href", "")
+                if not href or not re.match(r"/jobs/\d+", href):
                     continue
 
-            logger.info(f"  -> Found {len(hits)} hits, {len(jobs)} total")
+                full_url = "https://www.workatastartup.com" + href
+                if full_url in seen_urls:
+                    continue
+                seen_urls.add(full_url)
+
+                title_text = link.get_text(strip=True)
+                if title_text:
+                    jobs.append({
+                        "title": title_text,
+                        "company": "",
+                        "location": "",
+                        "url": full_url,
+                        "description": "",
+                        "site": "y-combinator",
+                        "date_posted": None,
+                        "salary": "",
+                    })
+                    found += 1
+
+            logger.info(f"  -> Found {found} jobs from HTML, {len(jobs)} total")
             time.sleep(1)
 
         except Exception as e:
-            logger.warning(f"  -> YC Algolia error: {e}")
-            _scrape_yc_html(jobs, seen_urls, query)
+            logger.warning(f"  -> YC error: {e}")
 
     return jobs
-
-
-def _scrape_yc_html(jobs: list, seen_urls: set, query: str):
-    """Fallback: scrape YC jobs via HTML if Algolia API fails."""
-    url = f"https://www.workatastartup.com/jobs?query={quote_plus(query)}"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        if resp.status_code != 200:
-            return
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        links = soup.select("a[href*='/jobs/']")
-
-        for link in links:
-            href = link.get("href", "")
-            if not href or href in seen_urls:
-                continue
-            if not re.match(r"/jobs/\d+", href):
-                continue
-
-            full_url = "https://www.workatastartup.com" + href
-            seen_urls.add(full_url)
-
-            title = link.get_text(strip=True)
-            if title:
-                jobs.append({
-                    "title": title,
-                    "company": "",
-                    "location": "",
-                    "url": full_url,
-                    "description": "",
-                    "site": "y-combinator",
-                    "date_posted": None,
-                    "salary": "",
-                })
-    except Exception as e:
-        logger.warning(f"  -> YC HTML fallback error: {e}")
 
 
 # -------------------------------------------------------------------

@@ -57,6 +57,130 @@ def validate_config():
     return True
 
 
+# -------------------------------------------------------------------
+# LOCATION FILTER
+# -------------------------------------------------------------------
+
+US_STATES = [
+    "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+    "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
+    "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana",
+    "maine", "maryland", "massachusetts", "michigan", "minnesota",
+    "mississippi", "missouri", "montana", "nebraska", "nevada",
+    "new hampshire", "new jersey", "new mexico", "new york",
+    "north carolina", "north dakota", "ohio", "oklahoma", "oregon",
+    "pennsylvania", "rhode island", "south carolina", "south dakota",
+    "tennessee", "texas", "utah", "vermont", "virginia", "washington",
+    "west virginia", "wisconsin", "wyoming", "district of columbia",
+]
+
+US_STATE_ABBREVS = [
+    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi",
+    "id", "il", "in", "ia", "ks", "ky", "la", "me", "md", "ma", "mi",
+    "mn", "ms", "mo", "mt", "ne", "nv", "nh", "nj", "nm", "ny", "nc",
+    "nd", "oh", "ok", "or", "pa", "ri", "sc", "sd", "tn", "tx", "ut",
+    "vt", "va", "wa", "wv", "wi", "wy", "dc",
+]
+
+# Georgia-area cities/regions for onsite matching
+GEORGIA_LOCATIONS = [
+    "atlanta", "marietta", "sandy springs", "alpharetta", "roswell",
+    "decatur", "kennesaw", "duluth", "lawrenceville", "savannah",
+    "augusta", "columbus", "macon", "athens", ", ga", "georgia",
+]
+
+NON_US_INDICATORS = [
+    "london", "uk", "united kingdom", "canada", "toronto", "vancouver",
+    "berlin", "germany", "france", "paris", "amsterdam", "netherlands",
+    "singapore", "india", "bangalore", "mumbai", "hyderabad", "delhi",
+    "australia", "sydney", "melbourne", "japan", "tokyo", "brazil",
+    "mexico", "dubai", "uae", "israel", "tel aviv", "ireland", "dublin",
+    "spain", "madrid", "barcelona", "italy", "milan", "rome",
+    "sweden", "stockholm", "norway", "oslo", "denmark", "copenhagen",
+    "switzerland", "zurich", "poland", "warsaw", "portugal", "lisbon",
+    "china", "shanghai", "beijing", "south korea", "seoul",
+]
+
+
+def _filter_by_location(jobs: list[dict]) -> list[dict]:
+    """
+    Keep only jobs that are:
+    - Remote (US-based or unspecified)
+    - Located in Georgia
+    - Hybrid in Georgia
+    - USA-based without onsite requirement outside Georgia
+    Remove:
+    - Non-US locations
+    - Onsite roles outside Georgia
+    """
+    kept = []
+
+    for job in jobs:
+        location = job.get("location", "").lower().strip()
+
+        # No location specified -- keep it (might be remote)
+        if not location:
+            kept.append(job)
+            continue
+
+        # Explicitly non-US -- reject
+        if any(loc in location for loc in NON_US_INDICATORS):
+            continue
+
+        # Remote -- always keep
+        if "remote" in location:
+            kept.append(job)
+            continue
+
+        # Georgia-based -- always keep
+        if any(ga in location for ga in GEORGIA_LOCATIONS):
+            kept.append(job)
+            continue
+
+        # Check if it's a US location
+        is_us = False
+        # Check state abbreviation pattern like "City, GA" or "City, CA"
+        for abbrev in US_STATE_ABBREVS:
+            if f", {abbrev}" in location or f" {abbrev}" == location[-3:]:
+                is_us = True
+                break
+
+        if not is_us:
+            for state in US_STATES:
+                if state in location:
+                    is_us = True
+                    break
+
+        if not is_us:
+            if "united states" in location or "usa" in location or "us" == location:
+                is_us = True
+
+        # US but not Georgia -- check if it says onsite/in-office
+        if is_us:
+            title_lower = job.get("title", "").lower()
+            desc_lower = job.get("description", "").lower()[:500]
+            combined = location + " " + title_lower + " " + desc_lower
+
+            # If explicitly onsite and not in Georgia, skip
+            if any(kw in combined for kw in ["onsite", "on-site", "in-office", "in office"]):
+                if not any(ga in location for ga in GEORGIA_LOCATIONS):
+                    continue
+
+            # Hybrid outside Georgia -- skip
+            if "hybrid" in combined:
+                if not any(ga in location for ga in GEORGIA_LOCATIONS):
+                    continue
+
+            # US-based, no onsite requirement -- keep (could be remote-friendly)
+            kept.append(job)
+            continue
+
+        # Unknown location -- keep it, scorer will handle
+        kept.append(job)
+
+    return kept
+
+
 def run_pipeline():
     """Execute the lean pipeline: Scrape -> Score -> Connections -> Notion."""
     start = datetime.now()
@@ -91,6 +215,23 @@ def run_pipeline():
     if not jobs:
         logger.info("No new jobs found. Done.")
         return
+
+    # ATS portal scanning (Greenhouse, Lever, Ashby, Workday)
+    logger.info("  ATS portals (Greenhouse, Lever, Ashby, Workday)...")
+    try:
+        from ats_scanner import scan_ats_portals
+        ats_jobs = scan_ats_portals()
+        existing_urls = {j["url"] for j in jobs}
+        new_ats = [j for j in ats_jobs if j["url"] not in existing_urls]
+        jobs.extend(new_ats)
+        logger.info(f"  -> ATS portals added {len(new_ats)} unique jobs")
+    except Exception as e:
+        logger.warning(f"  -> ATS scanner failed: {e}")
+
+    # -- LOCATION FILTER -- Remove non-US, non-Remote, onsite-outside-Georgia --
+    before_filter = len(jobs)
+    jobs = _filter_by_location(jobs)
+    logger.info(f"  Location filter: {before_filter} -> {len(jobs)} jobs (removed {before_filter - len(jobs)} non-US/non-GA)")
 
     # -- 2. SCORE & FILTER --
     from scorer import score_and_filter

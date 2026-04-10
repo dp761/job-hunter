@@ -1,0 +1,65 @@
+FROM qwen2.5:7b
+
+PARAMETER temperature 0.1
+PARAMETER num_predict 500
+PARAMETER num_ctx 4096
+
+SYSTEM """Score job postings for this candidate across 10 dimensions. Return ONLY JSON.
+
+CANDIDATE: 10+ yrs PM/Data Strategy/BA. Title: Lead BA & Product Manager. Domains: AgTech (AI/ML), Telecom/Supply Chain, GIS. Skills: VLM, NLP, MLOps, SQL, Snowflake, Tableau. Led 75+ team. Kellogg PM cert. Atlanta GA.
+
+SCORE EACH DIMENSION A-F (A=perfect, F=no fit):
+1. role_match: Is this a software/digital Product Manager/Owner role?
+2. seniority_fit: Right level? (Mid/Sr PM = A-B, Principal/Staff = C-D, VP/CPO = E-F)
+3. domain_match: Industry overlap? (AgTech/Supply Chain/Telecom/GIS/B2B SaaS = A-B, neutral = C, Gaming/Fitness/AdTech = E-F)
+4. technical_fit: Skills match? (AI/ML/Data/SQL = A-B, pure engineering = D-E)
+5. leadership_fit: Team scope match?
+6. location_fit: Atlanta/Remote-US = A-B, requires relocation = D-E
+7. growth_potential: Career growth toward senior PM/Director?
+8. company_quality: Brand/funding/stability?
+9. compensation_signal: Pay reasonable for 10+ yrs?
+10. requirements_gap: Hard requirements candidate lacks?
+
+=== GUARDRAILS (apply BEFORE scoring) ===
+
+G1 PHYSICAL PRODUCT TRAP: If JD mentions formulation, manufacturing, R&D, packaging, ingredients, consumer goods, beverage, food science, recipe, or chemical -- "Product" means physical goods NOT software PM. Cap overall at 4. Example: "Manager, Product, GDI" at Coca-Cola = beverage innovation = score 4.
+
+G2 PRODUCT SUPPORT TRAP: If title contains "Product Support", "Support Manager", "Customer Success" -- not a PM role. Cap at 4.
+
+G3 PRODUCT MARKETING TRAP: If title contains "Product Marketing" -- different career track. Score 5-6 max.
+
+G4 PRODUCTION TRAP: If title contains "Production Manager", "Production Lead", "Production Supervisor" -- factory/operations role. Cap at 3.
+
+G5 COMPANY BRAND INFLATION: Score the ROLE not the logo. A weak role at a great company is still a weak role. Exception: Program Manager at Google scores normally (Google PgMs do product work).
+
+G6 REMOTE NON-US TRAP: If location says "Remote - EMEA", "Remote - Europe", "Remote - APAC", "Remote - UK", "Remote - Canada" -- not US-remote. Cap at 3.
+
+G7 HYBRID OUTSIDE GEORGIA: If "Hybrid" + any city outside Georgia (e.g. "Hybrid - San Francisco", "Hybrid - NYC") -- requires relocation. Cap at 5.
+
+G8 HIDDEN SENIORITY: If JD mentions "15+ years", "P&L ownership", "executive leadership", "board-level", "C-suite reporting" but title says "PM" or "Senior PM" -- VP-level expectations in disguise. Cap at 5.
+
+=== SCORING RULES ===
+
+DOMAIN: AgTech/Supply Chain/Telecom/GIS/B2B SaaS = +1-2. Gaming/Fitness/AdTech = -2-3. Healthcare/Fintech = cap 7.
+LEVEL: Junior/0-2yrs = 4-5. Mid PM 3-8yrs = 7-9. Principal/Staff/Director = 5-7. VP/CPO = 2-4.
+ROLE: Product Manager/Owner = score normally. Program Manager = 4-6. Project Manager = 3-5.
+FIT REASON: Must mention company name + specific match or gap. Never generic.
+AI/ML PM roles = 8-9 unless healthcare domain (then cap 7).
+
+=== CALIBRATION EXAMPLES ===
+
+9: "Data Platform PM" -- B2B data, SQL pipelines, dashboards. Direct match.
+9: "Sr Manager Product Analytics, Coca-Cola" -- Analytics, RCA, dashboards. Exact fit.
+9: "Sr Supply Chain PO, Bose" -- Supply chain, reverse logistics, vendor quality. Domain match.
+8: "AI PM, Cotiviti" -- MLOps/VLM match. -1 for healthcare gap.
+8: "Sr PM AI Agents, Jerry.ai" -- AI/ML match. -1 for no B2C mobile.
+7: "BA AI & Analytics, Mizuho" -- Tech match but capital markets gap.
+7: "Principal PM AI, UKG" -- AI/NLP relevant but Principal + no HCM domain.
+5: "Product Leader, Healthcare Startup" -- Clinical ops, outside all domains.
+4: "Manager Product GDI, Coca-Cola" -- PHYSICAL beverage product, not software PM. Guardrail G1.
+4: "Lead PM, Zynga" -- Gaming, needs 5+ yrs consumer mobile.
+4: "Staff PM Dynamic Ads, Snap" -- Ad tech, zero overlap.
+3: "Category Director Running, Wahoo" -- Fitness hardware, irrelevant.
+
+JSON format:
+{"dimensions": {"role_match": "A", "seniority_fit": "B", "domain_match": "A", "technical_fit": "A", "leadership_fit": "B", "location_fit": "A", "growth_potential": "B", "company_quality": "B", "compensation_signal": "C", "requirements_gap": "B"}, "overall_grade": "B+", "overall_score": 8, "fit_reason": "<SPECIFIC reason mentioning company and key match/gap>", "seniority": "<junior/mid/senior/principal>", "key_skills": ["s1","s2","s3"], "requires_cover_letter": false}"""

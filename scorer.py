@@ -1,10 +1,10 @@
 """
-Job Scorer -- Local Ollama + Gemini Fallback
-=============================================
-Uses a local Ollama model for scoring (zero rate limits).
-Falls back to Gemini API if Ollama isn't running.
+Job Scorer -- 10-Dimension A-F Scoring
+========================================
+Scores jobs across 10 weighted dimensions (A-F) using local Ollama.
+Falls back to Gemini if Ollama isn't running.
 
-IMPORTANT: Edit CANDIDATE_PROFILE below to match YOUR background.
+Run `ollama create job-scorer -f Modelfile` once before first use.
 """
 
 import json
@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 # MODEL CONFIG
 # -------------------------------------------------------------------
 OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "qwen2.5:7b"  # Change to "llama3.2:3b" if too slow on your hardware
+CUSTOM_MODEL = "job-scorer"
+FALLBACK_MODEL = "qwen2.5:7b"
 
-# Gemini fallback
 GEMINI_AVAILABLE = False
 try:
     from google import genai
@@ -32,37 +32,84 @@ except ImportError:
     pass
 
 
-def _check_ollama() -> bool:
-    """Check if Ollama is running and the model is available."""
+def _check_ollama() -> tuple[bool, str]:
+    """Check Ollama and determine which model to use."""
     try:
         resp = requests.get("http://localhost:11434/api/tags", timeout=5)
         if resp.status_code == 200:
             models = [m.get("name", "") for m in resp.json().get("models", [])]
-            for m in models:
-                if OLLAMA_MODEL.split(":")[0] in m:
-                    logger.info(f"Ollama running with model: {m}")
-                    return True
-            logger.warning(f"Ollama running but '{OLLAMA_MODEL}' not found. Available: {models}")
-            logger.warning(f"Run: ollama pull {OLLAMA_MODEL}")
-            return False
+            model_names = [m.split(":")[0] for m in models]
+            if CUSTOM_MODEL in model_names:
+                logger.info(f"Using custom model: {CUSTOM_MODEL}")
+                return True, CUSTOM_MODEL
+            if FALLBACK_MODEL.split(":")[0] in model_names:
+                logger.warning(f"Custom model not found. Run: ollama create {CUSTOM_MODEL} -f Modelfile")
+                return True, FALLBACK_MODEL
+            return False, ""
     except Exception:
-        return False
+        return False, ""
 
 
-USE_OLLAMA = _check_ollama()
+USE_OLLAMA, OLLAMA_MODEL = _check_ollama()
 
 if USE_OLLAMA:
-    logger.info("Scoring engine: LOCAL (Ollama) -- no rate limits")
+    logger.info(f"Scoring engine: LOCAL ({OLLAMA_MODEL}) -- no rate limits")
 elif GEMINI_AVAILABLE:
-    logger.info("Scoring engine: GEMINI API (Ollama not running) -- rate limits apply")
+    logger.info("Scoring engine: GEMINI API")
 else:
-    logger.error("No scoring engine available. Install Ollama or configure Gemini API.")
+    logger.error("No scoring engine available.")
 
 # -------------------------------------------------------------------
-# PRE-FILTER: Skip obviously irrelevant jobs before scoring
+# GRADE WEIGHTS (how much each dimension matters for final score)
 # -------------------------------------------------------------------
+DIMENSION_WEIGHTS = {
+    "role_match": 2.0,       # Most important -- is this actually a PM role?
+    "seniority_fit": 1.5,    # Right level for you?
+    "domain_match": 1.5,     # Industry overlap?
+    "technical_fit": 1.3,    # Skills match?
+    "leadership_fit": 0.8,   # Team scale match?
+    "location_fit": 1.0,     # Location works?
+    "growth_potential": 0.7,  # Career growth?
+    "company_quality": 0.5,  # Company reputation?
+    "compensation_signal": 0.4,  # Pay reasonable?
+    "requirements_gap": 1.3,  # Hard gaps?
+}
 
-# Add keywords for roles you definitely DON'T want
+GRADE_TO_SCORE = {"A": 10, "B": 8, "C": 6, "D": 4, "E": 2, "F": 0}
+
+
+def _grade_to_numeric(grade: str) -> float:
+    """Convert A-F grade (with optional +/-) to numeric."""
+    grade = grade.strip().upper()
+    base = grade[0] if grade else "C"
+    score = GRADE_TO_SCORE.get(base, 5)
+    if "+" in grade:
+        score += 1
+    elif "-" in grade:
+        score -= 1
+    return max(0, min(10, score))
+
+
+def _calculate_weighted_score(dimensions: dict) -> float:
+    """Calculate weighted average from dimension grades."""
+    total_weight = 0
+    total_score = 0
+
+    for dim, weight in DIMENSION_WEIGHTS.items():
+        grade = dimensions.get(dim, "C")
+        score = _grade_to_numeric(grade)
+        total_score += score * weight
+        total_weight += weight
+
+    if total_weight == 0:
+        return 5.0
+
+    return round(total_score / total_weight, 1)
+
+
+# -------------------------------------------------------------------
+# PRE-FILTER
+# -------------------------------------------------------------------
 REJECT_KEYWORDS = [
     "nurse", "nursing", "registered nurse", "lpn", "rn ",
     "physician", "surgeon", "dentist", "pharmacist",
@@ -80,9 +127,11 @@ REJECT_KEYWORDS = [
     "devops engineer", "site reliability", "sre ",
     "frontend developer", "backend developer", "full stack developer",
     "machine learning engineer", "ml engineer",
+    # Guardrail traps
+    "production manager", "production lead", "production supervisor",
+    "product support manager", "customer success manager",
 ]
 
-# Keywords that signal a relevant job
 REQUIRE_KEYWORDS = [
     "product", "analyst", "business analyst", "solution architect",
     "program manager", "project manager", "scrum master",
@@ -91,15 +140,13 @@ REQUIRE_KEYWORDS = [
 
 
 def pre_filter(jobs: list[dict]) -> list[dict]:
-    """Fast keyword filter to remove obviously irrelevant jobs."""
+    """Fast keyword filter."""
     kept = []
     filtered = 0
-
     for job in jobs:
         title_lower = job["title"].lower()
         desc_lower = job.get("description", "").lower()[:500]
         combined = title_lower + " " + desc_lower
-
         if any(kw in title_lower for kw in REJECT_KEYWORDS):
             filtered += 1
             continue
@@ -110,55 +157,61 @@ def pre_filter(jobs: list[dict]) -> list[dict]:
             kept.append(job)
         else:
             filtered += 1
-
     logger.info(f"Pre-filter: {len(kept)} kept, {filtered} removed")
     return kept
 
 
 # -------------------------------------------------------------------
-# CANDIDATE PROFILE -- EDIT THIS TO MATCH YOUR BACKGROUND
-# -------------------------------------------------------------------
-# This is the context the AI uses to score each job against your fit.
-# Be specific: include your actual titles, skills, domains, and education.
-
-CANDIDATE_PROFILE = """
-- YOUR YEARS of experience in YOUR FIELD
-- Current/recent title: YOUR TITLE
-- Domains: YOUR INDUSTRIES
-- Technical skills: YOUR KEY SKILLS
-- Leadership: YOUR LEADERSHIP EXPERIENCE
-- Education: YOUR DEGREES AND CERTS
-- Location: YOUR CITY, STATE (and remote preference)
-"""
-
-# -------------------------------------------------------------------
-# SCORING PROMPT -- Customize scoring criteria if needed
+# SCORING PROMPTS
 # -------------------------------------------------------------------
 
-SCORING_PROMPT = """You are a career strategist evaluating job fit for a specific candidate.
+# For custom model (Modelfile has system prompt with all rules)
+SIMPLE_PROMPT = """Score this job posting across all 10 dimensions. Return ONLY JSON.
 
-CANDIDATE PROFILE:
-{candidate_profile}
+Title: {title}
+Company: {company}
+Location: {location}
+Description:
+{description}"""
 
-Evaluate this job posting and return ONLY valid JSON (no markdown, no backticks, no explanation):
+# For base model / Gemini (no Modelfile context)
+FULL_PROMPT = """You are a career strategist. Score this job for the candidate below across 10 dimensions (A-F).
 
-{{"score": <1-10>, "fit_reason": "<1 sentence>", "seniority": "<junior/mid/senior/unclear>", "key_skills": ["skill1", "skill2", "skill3"], "requires_cover_letter": <true/false>}}
+CANDIDATE: 10+ yrs PM/Data Strategy/BA. Domains: AgTech (AI/ML), Telecom/Supply Chain, GIS. Skills: VLM, NLP, MLOps, SQL, Snowflake, Tableau. Led 75+ team. Kellogg PM cert. Atlanta GA.
 
-Scoring guide:
-- 9-10: Strong match on role, level, skills, and domain
-- 7-8:  Good match on most criteria, minor gaps
-- 5-6:  Adjacent role or partial match
-- 3-4:  Weak match, wrong level, or mostly unrelated
-- 1-2:  Irrelevant
+DIMENSIONS (score each A-F):
+1. role_match: Software/digital PM/PO role? (Program/Project Mgr = D-E)
+2. seniority_fit: Right level? (Mid/Sr = A-B, Principal = C-D, VP = E-F)
+3. domain_match: Industry? (AgTech/Supply Chain/Telecom/GIS = A-B, Gaming/Fitness/AdTech = E-F)
+4. technical_fit: Skills match? (AI/ML/Data/SQL = A-B, pure eng = D-E)
+5. leadership_fit: Team scope match?
+6. location_fit: Atlanta/Remote-US = A-B, relocation = D-E
+7. growth_potential: Career growth?
+8. company_quality: Brand/funding?
+9. compensation_signal: Pay reasonable?
+10. requirements_gap: Hard gaps? (required domain exp = E-F)
 
-JOB POSTING:
+GUARDRAILS (apply BEFORE scoring):
+- PHYSICAL PRODUCT: If JD mentions formulation/manufacturing/R&D/packaging/ingredients/beverage/food science = NOT software PM. Cap 4.
+- PRODUCT SUPPORT/CUSTOMER SUCCESS in title = not PM. Cap 4.
+- PRODUCT MARKETING in title = different track. Cap 6.
+- PRODUCTION MANAGER = factory ops. Cap 3.
+- Score the ROLE not the company brand. Weak role at great company = still weak.
+- "Remote - EMEA/Europe/APAC/UK" = not US-remote. Cap 3.
+- "Hybrid" outside Georgia = requires relocation. Cap 5.
+- JD says "15+ years"/"P&L ownership"/"executive leadership" but title says PM = VP in disguise. Cap 5.
+
+Return ONLY JSON:
+{{"dimensions": {{"role_match": "A", "seniority_fit": "B", "domain_match": "A", "technical_fit": "A", "leadership_fit": "B", "location_fit": "A", "growth_potential": "B", "company_quality": "B", "compensation_signal": "C", "requirements_gap": "B"}}, "overall_grade": "B+", "overall_score": 8, "fit_reason": "<specific reason>", "seniority": "<level>", "key_skills": ["s1","s2","s3"], "requires_cover_letter": false}}
+
+JOB:
 Title: {title}
 Company: {company}
 Location: {location}
 Description:
 {description}
 
-Return ONLY the JSON object. Nothing else."""
+JSON only:"""
 
 
 # -------------------------------------------------------------------
@@ -166,7 +219,6 @@ Return ONLY the JSON object. Nothing else."""
 # -------------------------------------------------------------------
 
 def _score_with_ollama(prompt: str) -> str | None:
-    """Call local Ollama model."""
     try:
         resp = requests.post(
             OLLAMA_URL,
@@ -174,42 +226,30 @@ def _score_with_ollama(prompt: str) -> str | None:
                 "model": OLLAMA_MODEL,
                 "prompt": prompt,
                 "stream": False,
-                "options": {
-                    "temperature": 0.1,
-                    "num_predict": 300,
-                },
+                "options": {"temperature": 0.1, "num_predict": 500, "num_ctx": 4096},
             },
-            timeout=120,
+            timeout=300,
         )
         if resp.status_code == 200:
             return resp.json().get("response", "").strip()
-        else:
-            logger.warning(f"Ollama returned {resp.status_code}")
-            return None
+        return None
     except Exception as e:
         logger.warning(f"Ollama error: {e}")
         return None
 
 
 def _score_with_gemini(prompt: str) -> str | None:
-    """Call Gemini API as fallback."""
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=prompt,
-        )
+            model="gemini-2.5-flash-lite", contents=prompt)
         return response.text.strip()
     except Exception as e:
-        error_str = str(e)
-        if "429" in error_str or "quota" in error_str.lower():
-            logger.warning(f"Gemini rate limited: {e}")
-        else:
-            logger.warning(f"Gemini error: {e}")
+        logger.warning(f"Gemini error: {e}")
         return None
 
 
-def _parse_score_response(text: str, job: dict) -> dict | None:
-    """Parse JSON response and attach score fields to the job."""
+def _parse_response(text: str, job: dict) -> dict | None:
+    """Parse 10-dimension JSON response."""
     text = text.strip()
     text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
 
@@ -221,12 +261,41 @@ def _parse_score_response(text: str, job: dict) -> dict | None:
 
     try:
         result = json.loads(text)
-        job["score"] = result.get("score", 0)
+
+        dimensions = result.get("dimensions", {})
+
+        # Calculate weighted score if model didn't provide one
+        if dimensions:
+            calculated_score = _calculate_weighted_score(dimensions)
+            # Use model's score if provided, otherwise use calculated
+            model_score = result.get("overall_score", 0)
+            # Average model and calculated to get best of both
+            if model_score > 0:
+                final_score = round((model_score + calculated_score) / 2, 1)
+            else:
+                final_score = calculated_score
+        else:
+            final_score = result.get("overall_score", result.get("score", 0))
+
+        job["score"] = final_score
+        job["overall_grade"] = result.get("overall_grade", "")
+        job["dimensions"] = dimensions
         job["fit_reason"] = result.get("fit_reason", "")
         job["seniority"] = result.get("seniority", "unclear")
         job["key_skills"] = result.get("key_skills", [])
         job["requires_cover_letter"] = result.get("requires_cover_letter", False)
 
+        # Build dimension summary for Notion
+        if dimensions:
+            dim_parts = []
+            for dim, grade in dimensions.items():
+                short = dim.replace("_", " ").title()
+                dim_parts.append(f"{short}: {grade}")
+            job["dimension_summary"] = " | ".join(dim_parts)
+        else:
+            job["dimension_summary"] = ""
+
+        # Determine action
         if job["score"] >= config.AUTO_APPLY_MIN:
             job["action"] = "auto_apply"
         elif job["score"] >= config.FLAG_MIN:
@@ -235,37 +304,41 @@ def _parse_score_response(text: str, job: dict) -> dict | None:
             job["action"] = "skip"
 
         return job
+
     except json.JSONDecodeError:
         return None
 
 
 def score_job(job: dict) -> dict | None:
-    """Score a single job using Ollama (primary) or Gemini (fallback)."""
-    prompt = SCORING_PROMPT.format(
-        candidate_profile=CANDIDATE_PROFILE,
-        title=job["title"],
-        company=job["company"],
-        location=job["location"],
-        description=job["description"][:2500],
-    )
+    """Score a single job using best available engine."""
+    if USE_OLLAMA and OLLAMA_MODEL == CUSTOM_MODEL:
+        prompt = SIMPLE_PROMPT.format(
+            title=job["title"], company=job["company"],
+            location=job["location"], description=job["description"][:1500])
+    else:
+        prompt = FULL_PROMPT.format(
+            title=job["title"], company=job["company"],
+            location=job["location"], description=job["description"][:1500])
 
     if USE_OLLAMA:
         text = _score_with_ollama(prompt)
         if text:
-            result = _parse_score_response(text, job)
+            result = _parse_response(text, job)
             if result:
                 return result
-            # Retry once with stricter instruction
-            text = _score_with_ollama(prompt + "\n\nIMPORTANT: Return ONLY a JSON object, nothing else.")
+            text = _score_with_ollama(prompt + "\n\nReturn ONLY a JSON object.")
             if text:
-                result = _parse_score_response(text, job)
+                result = _parse_response(text, job)
                 if result:
                     return result
 
     if GEMINI_AVAILABLE:
-        text = _score_with_gemini(prompt)
+        gemini_prompt = FULL_PROMPT.format(
+            title=job["title"], company=job["company"],
+            location=job["location"], description=job["description"][:1500])
+        text = _score_with_gemini(gemini_prompt)
         if text:
-            return _parse_score_response(text, job)
+            return _parse_response(text, job)
 
     return None
 
@@ -275,7 +348,6 @@ def score_job(job: dict) -> dict | None:
 # -------------------------------------------------------------------
 SCORED_URLS_FILE = "scored_urls.txt"
 
-
 def _load_scored_urls() -> set:
     try:
         with open(SCORED_URLS_FILE, "r") as f:
@@ -283,20 +355,18 @@ def _load_scored_urls() -> set:
     except FileNotFoundError:
         return set()
 
-
 def _save_scored_url(url: str):
     with open(SCORED_URLS_FILE, "a") as f:
         f.write(url + "\n")
 
 
 # -------------------------------------------------------------------
-# MAIN SCORING PIPELINE
+# MAIN PIPELINE
 # -------------------------------------------------------------------
 
 def score_and_filter(jobs: list[dict]) -> list[dict]:
-    """Pre-filter, skip already-scored, then score. Returns sorted by score desc."""
-
-    logger.info(f"Pre-filtering {len(jobs)} jobs by keyword relevance...")
+    """Pre-filter, skip already-scored, then score with 10 dimensions."""
+    logger.info(f"Pre-filtering {len(jobs)} jobs...")
     jobs = pre_filter(jobs)
 
     if not jobs:
@@ -305,17 +375,16 @@ def score_and_filter(jobs: list[dict]) -> list[dict]:
 
     already_scored = _load_scored_urls()
     unscored = [j for j in jobs if j["url"] not in already_scored]
-    logger.info(f"Already scored: {len(jobs) - len(unscored)}, new to score: {len(unscored)}")
+    logger.info(f"Already scored: {len(jobs) - len(unscored)}, new: {len(unscored)}")
 
     if not unscored:
-        logger.info("All jobs already scored in previous runs.")
+        logger.info("All jobs already scored.")
         return []
 
-    # Cap per run only for Gemini (rate limits)
     if not USE_OLLAMA:
         MAX_PER_RUN = 15
         if len(unscored) > MAX_PER_RUN:
-            logger.info(f"Gemini mode: capping at {MAX_PER_RUN} jobs (had {len(unscored)})")
+            logger.info(f"Gemini mode: capping at {MAX_PER_RUN}")
             unscored = unscored[:MAX_PER_RUN]
 
     kept = []
@@ -324,12 +393,16 @@ def score_and_filter(jobs: list[dict]) -> list[dict]:
     for i, job in enumerate(unscored, 1):
         logger.info(f"Scoring [{i}/{total}]: {job['title']} @ {job['company']}")
         result = score_job(job)
-
         _save_scored_url(job["url"])
 
         if result and result["action"] != "skip":
             kept.append(result)
-            logger.info(f"  -> {result['score']}/10 -> {result['action']}")
+            grade = result.get("overall_grade", "")
+            dims = result.get("dimensions", {})
+            role = dims.get("role_match", "?")
+            domain = dims.get("domain_match", "?")
+            level = dims.get("seniority_fit", "?")
+            logger.info(f"  -> {result['score']}/10 ({grade}) Role:{role} Domain:{domain} Level:{level} -> {result['action']}")
         elif result:
             logger.info(f"  -> {result['score']}/10 -> skipped")
         else:
@@ -339,5 +412,5 @@ def score_and_filter(jobs: list[dict]) -> list[dict]:
             time.sleep(8)
 
     kept.sort(key=lambda j: j["score"], reverse=True)
-    logger.info(f"Kept {len(kept)}/{total} jobs (auto_apply + flag_for_review)")
+    logger.info(f"Kept {len(kept)}/{total} jobs")
     return kept

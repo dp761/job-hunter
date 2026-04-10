@@ -42,17 +42,32 @@ def _get_db_properties() -> dict:
         return {}
 
 
+def _find_prop_name(name: str) -> str | None:
+    """Find actual Notion property name, tolerant of whitespace differences."""
+    props = _get_db_properties()
+    # Exact match first
+    if name in props:
+        return name
+    # Try stripped matching (handles "Company " vs "Company")
+    name_stripped = name.strip().lower()
+    for key in props:
+        if key.strip().lower() == name_stripped:
+            return key
+    return None
+
+
 def _prop_exists(name: str) -> bool:
     """Check if a property exists in the database."""
-    props = _get_db_properties()
-    return name in props
+    return _find_prop_name(name) is not None
 
 
 def _prop_type(name: str) -> str:
     """Get the type of a property."""
+    actual_name = _find_prop_name(name)
+    if not actual_name:
+        return ""
     props = _get_db_properties()
-    prop = props.get(name, {})
-    return prop.get("type", "")
+    return props.get(actual_name, {}).get("type", "")
 
 
 def get_existing_urls() -> set:
@@ -101,39 +116,40 @@ def get_existing_urls() -> set:
 
 def _add_property(properties: dict, name: str, value):
     """Add a property to the payload only if it exists in the database."""
-    if not _prop_exists(name):
+    actual_name = _find_prop_name(name)
+    if not actual_name:
         return
 
     prop_type = _prop_type(name)
 
     try:
         if prop_type == "title":
-            properties[name] = {"title": [{"text": {"content": str(value)[:100]}}]}
+            properties[actual_name] = {"title": [{"text": {"content": str(value)[:100]}}]}
 
         elif prop_type == "rich_text":
-            properties[name] = {"rich_text": [{"text": {"content": str(value)[:2000]}}]}
+            properties[actual_name] = {"rich_text": [{"text": {"content": str(value)[:2000]}}]}
 
         elif prop_type == "number":
-            properties[name] = {"number": value if isinstance(value, (int, float)) else 0}
+            properties[actual_name] = {"number": value if isinstance(value, (int, float)) else 0}
 
         elif prop_type == "url":
-            properties[name] = {"url": str(value) if value else None}
+            properties[actual_name] = {"url": str(value) if value else None}
 
         elif prop_type == "select":
-            properties[name] = {"select": {"name": str(value)[:100]}}
+            properties[actual_name] = {"select": {"name": str(value)[:100]}}
 
         elif prop_type == "multi_select":
             if isinstance(value, list):
-                properties[name] = {"multi_select": [{"name": str(v)[:100]} for v in value[:10]]}
+                properties[actual_name] = {"multi_select": [{"name": str(v)[:100]} for v in value[:10]]}
             else:
-                properties[name] = {"multi_select": [{"name": str(value)[:100]}]}
+                properties[actual_name] = {"multi_select": [{"name": str(value)[:100]}]}
 
         elif prop_type == "date":
             if value:
-                properties[name] = {"date": {"start": str(value)}}
+                properties[actual_name] = {"date": {"start": str(value)}}
 
         elif prop_type == "checkbox":
-            properties[name] = {"checkbox": bool(value)}
+            properties[actual_name] = {"checkbox": bool(value)}
 
     except Exception as e:
         logger.warning(f"  -> Could not set property '{name}': {e}")
@@ -172,7 +188,9 @@ def log_job(job: dict) -> bool:
     _add_property(properties, "Company", job.get("company", ""))
     _add_property(properties, "Location", job.get("location", ""))
     _add_property(properties, "Score", job.get("score", 0))
+    _add_property(properties, "Grade", job.get("overall_grade", ""))
     _add_property(properties, "Fit Reason", job.get("fit_reason", ""))
+    _add_property(properties, "Dimensions", job.get("dimension_summary", ""))
     _add_property(properties, "Seniority", job.get("seniority", "unclear"))
     _add_property(properties, "Key Skills", ", ".join(job.get("key_skills", [])))
     _add_property(properties, "URL", job.get("url", ""))

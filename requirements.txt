@@ -4,3 +4,5 @@ requests>=2.31.0
 python-dotenv>=1.0.0
 schedule>=1.2.0
 beautifulsoup4>=4.12.0
+fpdf2>=2.7.0
+pypdf>=4.0.0
